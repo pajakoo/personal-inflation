@@ -1,3 +1,6 @@
 # Local Netlify folder
 .netlify
 .netlify-home
+
+# Dependencies
+node_modules/
