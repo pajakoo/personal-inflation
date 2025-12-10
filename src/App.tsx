@@ -196,6 +196,20 @@ function toCsvUrl(input: string){
 
 // ------------------ Eurostat fetch & parser ------------------
 const EUROSTAT_URL = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/prc_hicp_midx?format=JSON&lang=en&coicop=CP00&geo=BG&unit=I15&freq=M";
+const HOUSING_PRICE_URL = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/prc_hpi_q";
+const HOUSING_SDMX_BASE = "https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/PRC_HPI_Q";
+
+function timeKeyToMonth(tKey: string){
+  const s=String(tKey);
+  const m=s.match(/(\d{4})[-]?M(\d{2})/i);
+  if(m) return `${m[1]}-${m[2]}`;
+  const q=s.match(/(\d{4})[-]?Q([1-4])/i);
+  if(q){
+    const qStart:{[k:number]:string}={1:'01',2:'04',3:'07',4:'10'};
+    return `${q[1]}-${qStart[Number(q[2])]||'01'}`;
+  }
+  return s;
+}
 function parseEurostatJsonStat(js: any): Row[]{
   const dim=js?.dimension||js?.dataset?.dimension||{};
   const timeCat=(dim.time||dim.TIME||{}).category||{};
@@ -203,8 +217,7 @@ function parseEurostatJsonStat(js: any): Row[]{
   const values=js.value??js.dataset?.value??[];
   return Object.entries(indexMap).sort((a:any,b:any)=>a[1]-b[1]).map(([tKey,i]:any)=>{
     const raw=Array.isArray(values)? values[i]: values[i];
-    const m=String(tKey).match(/(\d{4})M(\d{2})/);
-    const date=m?`${m[1]}-${m[2]}`:String(tKey);
+    const date=timeKeyToMonth(String(tKey));
     return { date, value:Number(raw) };
   }).filter(r=>r.date && !Number.isNaN(r.value));
 }
@@ -263,6 +276,78 @@ async function fetchEurostatHICPFor(categories: string[]): Promise<Record<string
     out[code]=rows;
   }
   return out;
+}
+function parseSDMXHousingToRows(js: any, targetPurchase = "TOTAL"): Row[] {
+  const dataSet = js?.dataSets?.[0];
+  const seriesDims = js?.structure?.dimensions?.series || [];
+  const obsDims = js?.structure?.dimensions?.observation || [];
+  const timeDim = obsDims.find((d: any) => (d.id || "").toLowerCase() === "time");
+  const timeValues: string[] = (timeDim?.values || []).map((v: any) => v?.id);
+
+  const purchasePos = seriesDims.findIndex((d: any) => (d.id || "").toLowerCase() === "purchase");
+  const purchaseIndexToId: Record<string, string> = Object.fromEntries(
+    (seriesDims[purchasePos]?.values || []).map((v: any, i: number) => [String(i), v?.id])
+  );
+
+  const out: Row[] = [];
+  const seriesObj = dataSet?.series || {};
+
+  for (const sKey of Object.keys(seriesObj)) {
+    const parts = sKey.split(":");
+    const purchaseIdx = purchasePos >= 0 ? parts[purchasePos] : undefined;
+    const purchaseCode = purchaseIdx != null ? purchaseIndexToId[purchaseIdx] : undefined;
+    if (targetPurchase && purchaseCode && purchaseCode !== targetPurchase) continue;
+    const observations = seriesObj[sKey]?.observations || {};
+    for (const tIndexStr of Object.keys(observations)) {
+      const tIndex = Number(tIndexStr);
+      const date = timeValues?.[tIndex];
+      const val = observations[tIndexStr]?.[0];
+      if (date && typeof val === "number" && Number.isFinite(val)) {
+        out.push({ date: timeKeyToMonth(date), value: val });
+      }
+    }
+  }
+
+  return out.sort((a, b) => a.date.localeCompare(b.date));
+}
+async function fetchEurostatHousing(): Promise<Row[]>{
+  // Try SDMX 2.1 without unit (Eurostat rejects UNIT=I15)
+  const path = ['Q','TOTAL','BG'].join('.');
+  const sdmxUrl = `${HOUSING_SDMX_BASE}/${path}?time=2005-Q1:&format=JSON&compressed=false`;
+  let js: any | null = null;
+  try{
+    const res=await fetch(sdmxUrl, { method:'GET', credentials:'omit' });
+    if(res.ok){ js=await res.json(); }
+  }catch{/* fall through to JSON API */}
+
+  if(js){
+    if (isSDMXSeries(js)) {
+      const rows = parseSDMXHousingToRows(js, 'TOTAL');
+      if(rows.length) return rows;
+    }else{
+      const rows = parseEurostatCompactToRows(js)
+        .map(r=>({...r, date: timeKeyToMonth(r.date)}))
+        .sort((a,b)=>a.date.localeCompare(b.date));
+      if(rows.length) return rows;
+    }
+  }
+
+  // Fallback to JSON v1.0 (no unit param)
+  const params = new URLSearchParams({
+    format:'JSON',
+    lang:'en',
+    geo:'BG',
+    purchase:'TOTAL',
+    freq:'Q',
+    sinceTimePeriod:'2005-Q1'
+  });
+  const resJson = await fetch(`${HOUSING_PRICE_URL}?${params.toString()}&_=${Date.now()}`, { method:'GET', credentials:'omit' });
+  if(!resJson.ok){
+    await setMeta('lastEurostatHousingError',{status:resJson.status,statusText:resJson.statusText,when:new Date().toISOString()});
+    throw new Error('Eurostat housing error '+resJson.status);
+  }
+  const jsJson = await resJson.json();
+  return parseEurostatJsonStat(jsJson).sort((a,b)=>a.date.localeCompare(b.date));
 }
 
 
@@ -435,7 +520,8 @@ function InfoTooltip({ active, payload, label }: any){
     wage: "Заплата ребазирана (=100 в началния месец).",
     hicp: "Официален индекс на потребителските цени (HICP).",
     real: "Покупателна способност = заплата/цени.",
-    personal: "Личен индекс според твоите разходи и HICP по категории."
+    personal: "Личен индекс според твоите разходи и HICP по категории.",
+    housingPrice: "Средна цена на жилище (индекс, 2015=100) от Eurostat."
   };
   return (
     <div style={{background:'#fff',border:'1px solid #e5e7eb',borderRadius:12,padding:'8px 10px',boxShadow:'0 2px 6px rgba(0,0,0,.05)'}}>
@@ -768,8 +854,10 @@ export default function App(){
   const [expenses,setExpenses]=useState<Expense[]>([]);
   const [hicpByCoicop,setHicpByCoicop]=useState<Record<string,Row[]>>({});
   const [catStatus,setCatStatus]=useState('');
+  const [housingStatus,setHousingStatus]=useState('');
   const [weightsBaseUsed,setWeightsBaseUsed]=useState<string|null>(null);
   const [avgWages, setAvgWages] = useState<Row[]>([]);
+  const [housingPrices, setHousingPrices] = useState<Row[]>([]);
   const [resetCounter, setResetCounter] = useState(0);
 
   useEffect(()=>{ loadRows('wages').then(setWages); loadRows('hicp').then(setHicp); loadExpenses().then(setExpenses); },[]);
@@ -788,20 +876,24 @@ export default function App(){
   
   const [start,setStart]=useState('2015-01'); const [end,setEnd]=useState('2000-01');
 
+  const wageSeries = useMemo(()=> toMonthlySeries(wages), [wages]);
+  const housingSeries = useMemo(()=> toMonthlySeries(housingPrices), [housingPrices]);
   const touched=useRef(false);
   useEffect(()=>{ 
     if(touched.current) return; 
-    if(!hicpSeries.length) return; 
-    const last=hicpSeries[hicpSeries.length-1].date; 
+    const base = hicpSeries.length ? hicpSeries : (housingSeries.length ? housingSeries : wageSeries);
+    if(!base.length) return; 
+    const last=base[base.length-1].date; 
     setStart('2015-01'); 
     setEnd(last); 
-  },[hicpSeries.length]);
+  },[hicpSeries.length, housingSeries.length, wageSeries.length]);
 
-  const wageSeries = useMemo(()=> toMonthlySeries(wages), [wages]);
   const rebasedWage = useMemo(()=> rebaseTo100(wageSeries, start), [wageSeries,start]);
   const rebasedHicp = useMemo(()=> rebaseTo100(hicpSeries, start), [hicpSeries,start]);
+  const rebasedHousing = useMemo(()=> rebaseTo100(housingSeries, start), [housingSeries,start]);
   const slicedW = useMemo(()=> rangeSlice(rebasedWage,start,end), [rebasedWage,start,end]);
   const slicedC = useMemo(()=> rangeSlice(rebasedHicp,start,end), [rebasedHicp,start,end]);
+  const slicedHousing = useMemo(()=> rangeSlice(rebasedHousing,start,end), [rebasedHousing,start,end]);
   const avgWageSeries = useMemo(()=> toMonthlySeries(avgWages), [avgWages]);
   const rebasedAvgWage = useMemo(()=> rebaseTo100(avgWageSeries, start), [avgWageSeries,start]);
   const slicedAvg = useMemo(()=> rangeSlice(rebasedAvgWage, start, end), [rebasedAvgWage,start,end]);
@@ -809,18 +901,20 @@ export default function App(){
     const set = new Set<string>();
     slicedW.forEach(r=>set.add(r.date));
     slicedC.forEach(r=>set.add(r.date));
+    slicedHousing.forEach(r=>set.add(r.date));
+    slicedAvg.forEach(r=>set.add(r.date));
     return [...set].sort();
-  }, [slicedW, slicedC]);
+  }, [slicedW, slicedC, slicedHousing, slicedAvg]);
   const pickerDates = useMemo(()=>{
       // prefer HICP, else avgWage, else personal wages
       const base = hicpSeries.length ? hicpSeries
                 : (avgWageSeries.length ? avgWageSeries
-                : wageSeries);
+                : (wageSeries.length ? wageSeries : housingSeries));
       if (!base.length) return [];
       const first = base[0].date;
       const last = base[base.length - 1].date;
       return monthRange(first, last);
-    }, [hicpSeries, avgWageSeries, wageSeries]);
+    }, [hicpSeries, avgWageSeries, wageSeries, housingSeries]);
   // Personal index with fallback weights
   const { baseUsed, weights } = useMemo(()=> pickBaseMonthForWeights(expenses, start), [expenses, start]);
   useEffect(()=>{ setWeightsBaseUsed(baseUsed); }, [baseUsed]);
@@ -840,16 +934,22 @@ export default function App(){
       x.avgWage = Number.isFinite(r.value) ? r.value : undefined;
       map.set(r.date, x);
     });
+    slicedHousing.forEach(r=>{
+      const x = map.get(r.date) || { date: r.date };
+      x.housingPrice = Number.isFinite(r.value) ? r.value : undefined;
+      map.set(r.date, x);
+    });
     return [...map.values()].sort((a,b)=>a.date.localeCompare(b.date)).map(row=>({
       ...row,
       real: row.wage!=null && row.hicp!=null ? row.wage / (row.hicp/100) : undefined,
       personal: personalMap.get(row.date)
     }));
-  }, [slicedW, slicedC, slicedAvg, personalMap]);
+  }, [slicedW, slicedC, slicedAvg, slicedHousing, personalMap]);
 
 // Changes using nearest points (fix for sparse data)
 const wageChange = useMemo(()=> changePctNearest(wageSeries, start, end), [wageSeries,start,end]);
 const avgWageChange = useMemo(()=> changePctNearest(avgWageSeries, start, end), [avgWageSeries,start,end]); // ← add this
+const housingChange = useMemo(()=> changePctNearest(housingSeries, start, end), [housingSeries,start,end]);
 const hicpChange = useMemo(()=> changePctNearest(hicpSeries, start, end), [hicpSeries,start,end]);
 const realChange = wageChange!=null && hicpChange!=null ? wageChange - hicpChange : null;
 
@@ -866,10 +966,11 @@ const realChangePersonal = wageChange!=null && personalChange!=null
 // min/max real index over selected range
 const extrema = useMemo(()=>{ const rows = merged.filter(r=> typeof r.real==='number'); if(!rows.length) return null; let min=rows[0], max=rows[0]; for(const r of rows){ if(r.real<min.real) min=r; if(r.real>max.real) max=r; } return { min, max }; }, [merged]);
 const chartKey = useMemo(()=> 
-  `${start}-${end}-${wageSeries.length}-${avgWageSeries.length}-${hicpSeries.length}-${Object.keys(hicpByCoicop).length}`, 
-  [start,end,wageSeries.length,avgWageSeries.length,hicpSeries.length,hicpByCoicop]
+  `${start}-${end}-${wageSeries.length}-${avgWageSeries.length}-${housingSeries.length}-${hicpSeries.length}-${Object.keys(hicpByCoicop).length}`, 
+  [start,end,wageSeries.length,avgWageSeries.length,housingSeries.length,hicpSeries.length,hicpByCoicop]
 );
 const hasAvg = avgWages.length > 0;
+const hasHousing = housingPrices.length > 0;
 
 // Default CSV asset URLs (served by Vite)
 const DEFAULT_WAGES_CSV = new URL('../data/avg_wage_bg_2015_2025.csv', import.meta.url);
@@ -917,8 +1018,8 @@ const loadDefaults = async () => {
     onClick={async()=>{
       await clearAllData();
       // clear in-memory state
-      setWages([]); setHicp([]); setExpenses([]); setAvgWages([]);
-      setHicpByCoicop({}); setCatStatus(''); setWeightsBaseUsed(null);
+      setWages([]); setHicp([]); setExpenses([]); setAvgWages([]); setHousingPrices([]);
+      setHicpByCoicop({}); setCatStatus(''); setWeightsBaseUsed(null); setHousingStatus('');
       setResetCounter(c => c + 1);
     }}
   >
@@ -932,7 +1033,7 @@ const loadDefaults = async () => {
           <h2 className="section-title">1) Въведи/обнови заплати</h2>
           <SalaryTable key={resetCounter} onChange={setWages}/>
           <WagesUploader onRows={setWages}/>
-          <div className="row mt-2">
+      <div className="row mt-2">
           <button
             className="btn"
             onClick={async()=>{
@@ -954,6 +1055,27 @@ const loadDefaults = async () => {
           >
             {hasAvg ? 'Премахни средна заплата (БГ)' : 'Зареди средна заплата (БГ)'}
           </button>
+          <button
+            className="btn"
+            onClick={async()=>{
+              if(hasHousing){
+                setHousingPrices([]);
+                setHousingStatus('');
+                return;
+              }
+              setHousingStatus('Зареждане на средна цена на жилище...');
+              try{
+                const rows = await fetchEurostatHousing();
+                setHousingPrices(rows);
+                setHousingStatus(`Заредени ${rows.length} периода (квартални данни).`);
+              }catch(e:any){
+                setHousingStatus('Грешка: '+(e?.message||e));
+              }
+            }}
+          >
+            {hasHousing ? 'Премахни средна цена на жилище (БГ)' : 'Зареди средна цена на жилище (БГ)'}
+          </button>
+          {housingStatus && <div className="help">{housingStatus}</div>}
           </div>
         </div>
         <div className="card">
@@ -1013,6 +1135,9 @@ setHicpByCoicop(prev => ({ ...prev, ...byCode }));
           {hasAvg && (
             <Card title="Средна заплата (БГ)" value={avgWageChange!=null? (avgWageChange*100).toFixed(1)+'%':'—'} note="Най-близки налични месеци"/>
           )}
+          {hasHousing && (
+            <Card title="Средна цена на жилище (БГ)" value={housingChange!=null? (housingChange*100).toFixed(1)+'%':'—'} note="Квартални данни, ребазирани към началото"/>
+          )}
         </div>
 
         {extrema && (
@@ -1041,6 +1166,9 @@ setHicpByCoicop(prev => ({ ...prev, ...byCode }));
               <Line type="monotone" dataKey="hicp" name="Индекс цени (HICP, =100)" stroke="#16a34a" dot={false} connectNulls isAnimationActive={false} />
               <Line type="monotone" dataKey="real" name="Реален индекс (заплата/цени)" stroke="#dc2626" dot={false} connectNulls isAnimationActive={false} />
               <Line type="monotone" dataKey="personal" name="Личен индекс (=100)" stroke="#7c3aed" dot={false} connectNulls isAnimationActive={false} />
+              {hasHousing && (
+                <Line type="monotone" dataKey="housingPrice" name="Средна цена на жилище (БГ, =100)" stroke="#0ea5e9" dot={false} connectNulls isAnimationActive={false} />
+              )}
               {hasAvg && (
                 <Line type="monotone" dataKey="avgWage" name="Индекс средна заплата (БГ, =100)" stroke="#f59e0b" dot={false} connectNulls isAnimationActive={false} />
               )} 
