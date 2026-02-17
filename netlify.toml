@@ -1,3 +1,15 @@
 [build]
   command = "npm run build"
-  publish = "dist"
+  publish = ".next"
+
+[context.production]
+  branch = "main"
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
+
+[[redirects]]
+  from = "/"
+  to = "/en"
+  status = 301
+  force = true
