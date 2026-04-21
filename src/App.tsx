@@ -137,6 +137,49 @@ function monthRange(s: string, e: string){
   return out;
 }
 
+function addMonths(month: string, delta: number){
+  const [yRaw, mRaw] = month.split('-').map(Number);
+  if (!Number.isFinite(yRaw) || !Number.isFinite(mRaw)) return month;
+  const base = new Date(Date.UTC(yRaw, mRaw - 1, 1));
+  base.setUTCMonth(base.getUTCMonth() + delta);
+  return `${base.getUTCFullYear()}-${String(base.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function buildEstimatedHicpSeries(series: Row[], targetEnd: string, lookbackMonths = 12): Row[] {
+  const sorted = toMonthlySeries(series);
+  if (!sorted.length) return [];
+  const last = sorted[sorted.length - 1];
+  if (targetEnd <= last.date) return sorted;
+
+  const from = Math.max(1, sorted.length - lookbackMonths);
+  let sumRate = 0;
+  let n = 0;
+  for (let i = from; i < sorted.length; i += 1) {
+    const prev = sorted[i - 1]?.value;
+    const curr = sorted[i]?.value;
+    if (typeof prev === 'number' && prev > 0 && typeof curr === 'number' && Number.isFinite(curr)) {
+      sumRate += curr / prev - 1;
+      n += 1;
+    }
+  }
+  const monthlyRate = n > 0 ? sumRate / n : 0;
+
+  const out = [...sorted];
+  let cursorDate = last.date;
+  let cursorValue = last.value;
+  while (cursorDate < targetEnd) {
+    cursorDate = addMonths(cursorDate, 1);
+    cursorValue *= 1 + monthlyRate;
+    out.push({ date: cursorDate, value: cursorValue });
+  }
+  return out;
+}
+
+function currentMonthKey(){
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+}
+
 // ------------------ CSV & URL helpers ------------------
 function parseWagesCSV(text: string): Row[]{
   const lines=text.trim().split(/\r?\n/); if(!lines.length) return [];
@@ -495,6 +538,134 @@ function Card({ title, value, note }: { title: string; value: string; note?: str
   );
 }
 
+const MONTH_LABELS = ['Ян', 'Фев', 'Мар', 'Апр', 'Май', 'Юни', 'Юли', 'Авг', 'Сеп', 'Окт', 'Ное', 'Дек'];
+
+function formatMonthLabel(value: string){
+  const [year, month] = value.split('-');
+  const idx = Number(month) - 1;
+  if (!year || !month || idx < 0 || idx >= MONTH_LABELS.length) return value;
+  return `${MONTH_LABELS[idx]} ${year}`;
+}
+
+function isWithinRange(value: string, min?: string, max?: string){
+  if (min && value < min) return false;
+  if (max && value > max) return false;
+  return true;
+}
+
+function clampYear(year: number, min?: string, max?: string){
+  const minYear = min ? Number(min.split('-')[0]) : undefined;
+  const maxYear = max ? Number(max.split('-')[0]) : undefined;
+  if (Number.isFinite(minYear) && year < (minYear as number)) return minYear as number;
+  if (Number.isFinite(maxYear) && year > (maxYear as number)) return maxYear as number;
+  return year;
+}
+
+function MonthPicker({
+  value,
+  onChange,
+  min,
+  max,
+  placeholder = 'Избери месец'
+}:{
+  value: string;
+  onChange: (next: string) => void;
+  min?: string;
+  max?: string;
+  placeholder?: string;
+}){
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const [open, setOpen] = useState(false);
+  const rangeValid = !(min && max && min > max);
+  const effectiveMin = rangeValid ? min : undefined;
+  const effectiveMax = rangeValid ? max : undefined;
+  const [viewYear, setViewYear] = useState(() => {
+    const valueYear = Number(value.split('-')[0]);
+    if (Number.isFinite(valueYear)) return clampYear(valueYear, effectiveMin, effectiveMax);
+    if (effectiveMin) return Number(effectiveMin.split('-')[0]);
+    return new Date().getFullYear();
+  });
+
+  useEffect(() => {
+    const year = Number(value.split('-')[0]);
+    if (Number.isFinite(year)) {
+      setViewYear(clampYear(year, effectiveMin, effectiveMax));
+    }
+  }, [value, effectiveMin, effectiveMax]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onClick = (event: MouseEvent) => {
+      if (wrapperRef.current && !wrapperRef.current.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onClick);
+    return () => document.removeEventListener('mousedown', onClick);
+  }, [open]);
+
+  const minYear = effectiveMin ? Number(effectiveMin.split('-')[0]) : viewYear - 10;
+  const maxYear = effectiveMax ? Number(effectiveMax.split('-')[0]) : viewYear + 10;
+  const years: number[] = [];
+  for (let y = minYear; y <= maxYear; y += 1) {
+    years.push(y);
+  }
+
+  return (
+    <div className="month-picker" ref={wrapperRef}>
+      <button
+        type="button"
+        className="month-input"
+        onClick={() => setOpen(prev => !prev)}
+      >
+        {value ? formatMonthLabel(value) : placeholder}
+      </button>
+      {open && (
+        <div className="month-popover">
+          <div className="month-header">
+            <button type="button" className="month-nav" onClick={() => setViewYear(y => clampYear(y - 1, effectiveMin, effectiveMax))}>
+              ‹
+            </button>
+            <select
+              className="month-year-select"
+              value={viewYear}
+              onChange={event => setViewYear(Number(event.target.value))}
+            >
+              {years.map(year => (
+                <option key={year} value={year}>{year}</option>
+              ))}
+            </select>
+            <button type="button" className="month-nav" onClick={() => setViewYear(y => clampYear(y + 1, effectiveMin, effectiveMax))}>
+              ›
+            </button>
+          </div>
+          <div className="month-grid">
+            {MONTH_LABELS.map((label, idx) => {
+              const nextValue = `${viewYear}-${String(idx + 1).padStart(2, '0')}`;
+              const disabled = !isWithinRange(nextValue, effectiveMin, effectiveMax);
+              const selected = value === nextValue;
+              return (
+                <button
+                  key={label}
+                  type="button"
+                  className={`month-btn${selected ? ' is-selected' : ''}`}
+                  disabled={disabled}
+                  onClick={() => {
+                    onChange(nextValue);
+                    setOpen(false);
+                  }}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PeriodPickerMonth({
   min, max, start, end, onChange
 }:{min:string; max:string; start:string; end:string; onChange:(s:string,e:string)=>void}){
@@ -502,11 +673,11 @@ function PeriodPickerMonth({
     <div className="row row-lg">
       <div>
         <div className="help">Начало</div>
-        <input type="month" min={min} max={max} value={start} onChange={e=>onChange(e.target.value, end)} />
+        <MonthPicker value={start} min={min} max={max} onChange={next => onChange(next, end)} />
       </div>
       <div>
         <div className="help">Край</div>
-        <input type="month" min={min} max={max} value={end} onChange={e=>onChange(start, e.target.value)} />
+        <MonthPicker value={end} min={min} max={max} onChange={next => onChange(start, next)} />
       </div>
     </div>
   );
@@ -518,7 +689,8 @@ function InfoTooltip({ active, payload, label }: any){
   const rows = payload.filter((p:any)=>p.value!=null);
   const explain: Record<string,string> = {
     wage: "Заплата ребазирана (=100 в началния месец).",
-    hicp: "Официален индекс на потребителските цени (HICP).",
+    hicpOfficial: "Официален индекс на потребителските цени (HICP).",
+    hicpEstimated: "Оценка след последния публикуван месец.",
     real: "Покупателна способност = заплата/цени.",
     personal: "Личен индекс според твоите разходи и HICP по категории.",
     housingPrice: "Средна цена на жилище (индекс, 2015=100) от Eurostat."
@@ -645,7 +817,7 @@ function SalaryTable({ onChange }:{onChange:(rows:Row[])=>void}){
   return (
     <div className="grid">
       <div className="row">
-        <input value={date} onChange={e=>setDate(e.target.value)} placeholder="YYYY-MM"/>
+        <MonthPicker value={date} onChange={setDate} />
         <input type="number" value={value} onChange={e=>setValue(Number(e.target.value))} placeholder="Заплата (лв.)"/>
         <button onClick={upsert} className="btn btn-primary">Запази</button>
       </div>
@@ -706,6 +878,107 @@ function WagesUploader({ onRows }:{onRows:(rows:Row[])=>void}){
         <button className="btn" onClick={async()=>{ const rows=parseWagesCSV(paste); await handleParsed(rows,'Поставен CSV'); }}>Импорт от текст</button>
         {status && <div className="help" data-testid="wages-status">{status}</div>}
       </div>
+    </div>
+  );
+}
+
+function PrivateWagesLoader({ onRows }:{onRows:(rows:Row[])=>void}){
+  const [password, setPassword] = useState('');
+  const [status, setStatus] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [failedAttempts, setFailedAttempts] = useState(0);
+  const [lockedUntil, setLockedUntil] = useState<number | null>(null);
+  const nowTs = Date.now();
+  const remainingSec = lockedUntil && lockedUntil > nowTs
+    ? Math.ceil((lockedUntil - nowTs) / 1000)
+    : 0;
+  const isLocked = remainingSec > 0;
+
+  const loadPrivateWages = async ()=>{
+    if (isLocked || loading) return;
+    if (!password.trim()) {
+      setStatus('Въведи парола.');
+      return;
+    }
+    setLoading(true);
+    setStatus('Зареждане на лични заплати...');
+    try {
+      const res = await fetch('/.netlify/functions/private-wages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password })
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const nextFailed = failedAttempts + 1;
+        setFailedAttempts(nextFailed);
+        if (res.status === 401 && nextFailed >= 3) {
+          const lockMs = 30_000;
+          const until = Date.now() + lockMs;
+          setLockedUntil(until);
+          setFailedAttempts(0);
+          setStatus('Твърде много грешни опити. Опитай отново след 30 сек.');
+          return;
+        }
+        setStatus(`Грешка: ${payload?.error || `HTTP ${res.status}`}`);
+        return;
+      }
+
+      const rawRows = Array.isArray(payload?.rows) ? payload.rows : [];
+      const rows: Row[] = rawRows
+        .map((r:any)=>({ date: String(r?.date || ''), value: Number(r?.value) }))
+        .filter((r:Row)=> /^\d{4}-\d{2}$/.test(r.date) && Number.isFinite(r.value))
+        .sort((a:Row,b:Row)=>a.date.localeCompare(b.date));
+
+      if (!rows.length) {
+        setStatus('Няма валидни редове в защитения файл.');
+        return;
+      }
+
+      await saveRows('wages', rows);
+      onRows(rows);
+      setFailedAttempts(0);
+      setLockedUntil(null);
+      setPassword('');
+      setStatus(`Лични заплати: ${rows.length} реда (заменени).`);
+    } catch (e:any) {
+      setStatus('Грешка: ' + (e?.message || e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!lockedUntil) return;
+    if (lockedUntil <= Date.now()) {
+      setLockedUntil(null);
+      return;
+    }
+    const id = window.setInterval(() => {
+      if (lockedUntil <= Date.now()) setLockedUntil(null);
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [lockedUntil]);
+
+  return (
+    <div className="mt-3">
+      <div className="text-muted-2" style={{fontSize:14,fontWeight:600}}>Защитено зареждане на лични заплати</div>
+      <div className="row row-lg mt-2">
+        <input
+          type="password"
+          className="w-100 minw-240"
+          placeholder="Парола"
+          value={password}
+          onChange={e=>setPassword(e.target.value)}
+          onKeyDown={e=>{ if (e.key === 'Enter') loadPrivateWages(); }}
+          disabled={loading || isLocked}
+        />
+        <button className="btn btn-primary" onClick={loadPrivateWages} disabled={loading || isLocked}>
+          {loading ? 'Зареждане...' : 'Зареди моята заплата'}
+        </button>
+      </div>
+      {isLocked && <div className="help">Заключено за {remainingSec} сек.</div>}
+      {status && <div className="help">{status}</div>}
     </div>
   );
 }
@@ -812,7 +1085,7 @@ function ExpensesTable({ onChange }:{onChange:(rows:Expense[])=>void}){
   return (
     <div className="grid">
       <div className="row">
-        <input value={date} onChange={e=>setDate(e.target.value)} placeholder="YYYY-MM"/>
+        <MonthPicker value={date} onChange={setDate} />
         <select value={category} onChange={e=>setCategory(e.target.value as any)}>
           {CATEGORY_KEYS.map(k=> <option key={k} value={k}>{displayCategory(k)}</option>)}
         </select>
@@ -859,6 +1132,7 @@ export default function App(){
   const [avgWages, setAvgWages] = useState<Row[]>([]);
   const [housingPrices, setHousingPrices] = useState<Row[]>([]);
   const [resetCounter, setResetCounter] = useState(0);
+  const [inflationMode, setInflationMode] = useState<'official' | 'estimate'>('official');
 
   useEffect(()=>{ loadRows('wages').then(setWages); loadRows('hicp').then(setHicp); loadExpenses().then(setExpenses); },[]);
 // On first run with empty stores, autoload defaults once
@@ -873,23 +1147,35 @@ export default function App(){
 // }, [wages.length, hicp.length, expenses.length]);
 
   const hicpSeries = useMemo(()=> toMonthlySeries(hicp), [hicp]);
+  const lastOfficialHicpMonth = hicpSeries.length ? hicpSeries[hicpSeries.length - 1].date : null;
   
-  const [start,setStart]=useState('2015-01'); const [end,setEnd]=useState('2000-01');
+  const [start,setStart]=useState('2015-01'); const [end,setEnd]=useState(currentMonthKey());
 
   const wageSeries = useMemo(()=> toMonthlySeries(wages), [wages]);
   const housingSeries = useMemo(()=> toMonthlySeries(housingPrices), [housingPrices]);
+  const estimatedHicpSeries = useMemo(()=> buildEstimatedHicpSeries(hicpSeries, end), [hicpSeries, end]);
+  const hicpSeriesForCalc = useMemo(
+    ()=> inflationMode === 'estimate' ? estimatedHicpSeries : hicpSeries,
+    [inflationMode, estimatedHicpSeries, hicpSeries]
+  );
+  const estimatedHicpDates = useMemo(()=>{
+    if (!lastOfficialHicpMonth) return new Set<string>();
+    return new Set(estimatedHicpSeries.filter(r => r.date > lastOfficialHicpMonth).map(r => r.date));
+  }, [estimatedHicpSeries, lastOfficialHicpMonth]);
   const touched=useRef(false);
   useEffect(()=>{ 
     if(touched.current) return; 
     const base = hicpSeries.length ? hicpSeries : (housingSeries.length ? housingSeries : wageSeries);
     if(!base.length) return; 
     const last=base[base.length-1].date; 
+    const current = currentMonthKey();
+    const maxDate = current > last ? current : last;
     setStart('2015-01'); 
-    setEnd(last); 
+    setEnd(maxDate); 
   },[hicpSeries.length, housingSeries.length, wageSeries.length]);
 
   const rebasedWage = useMemo(()=> rebaseTo100(wageSeries, start), [wageSeries,start]);
-  const rebasedHicp = useMemo(()=> rebaseTo100(hicpSeries, start), [hicpSeries,start]);
+  const rebasedHicp = useMemo(()=> rebaseTo100(hicpSeriesForCalc, start), [hicpSeriesForCalc,start]);
   const rebasedHousing = useMemo(()=> rebaseTo100(housingSeries, start), [housingSeries,start]);
   const slicedW = useMemo(()=> rangeSlice(rebasedWage,start,end), [rebasedWage,start,end]);
   const slicedC = useMemo(()=> rangeSlice(rebasedHicp,start,end), [rebasedHicp,start,end]);
@@ -907,14 +1193,19 @@ export default function App(){
   }, [slicedW, slicedC, slicedHousing, slicedAvg]);
   const pickerDates = useMemo(()=>{
       // prefer HICP, else avgWage, else personal wages
-      const base = hicpSeries.length ? hicpSeries
+      const hicpBase = inflationMode === 'estimate' ? hicpSeriesForCalc : hicpSeries;
+      const base = hicpBase.length ? hicpBase
                 : (avgWageSeries.length ? avgWageSeries
                 : (wageSeries.length ? wageSeries : housingSeries));
       if (!base.length) return [];
       const first = base[0].date;
       const last = base[base.length - 1].date;
-      return monthRange(first, last);
-    }, [hicpSeries, avgWageSeries, wageSeries, housingSeries]);
+      const current = currentMonthKey();
+      const maxDate = inflationMode === 'estimate'
+        ? (current > last ? current : last)
+        : last;
+      return monthRange(first, maxDate);
+    }, [inflationMode, hicpSeriesForCalc, hicpSeries, avgWageSeries, wageSeries, housingSeries]);
   // Personal index with fallback weights
   const { baseUsed, weights } = useMemo(()=> pickBaseMonthForWeights(expenses, start), [expenses, start]);
   useEffect(()=>{ setWeightsBaseUsed(baseUsed); }, [baseUsed]);
@@ -928,7 +1219,13 @@ export default function App(){
   const merged = useMemo(()=>{
     const map = new Map<string, any>();
     slicedW.forEach(r=>map.set(r.date,{date:r.date,wage: Number.isFinite(r.value)?r.value:undefined}));
-    slicedC.forEach(r=>{ const x=map.get(r.date)||{date:r.date}; x.hicp= Number.isFinite(r.value)?r.value:undefined; map.set(r.date,x); });
+    slicedC.forEach(r=>{
+      const x=map.get(r.date)||{date:r.date};
+      x.hicp = Number.isFinite(r.value) ? r.value : undefined;
+      if (estimatedHicpDates.has(r.date)) x.hicpEstimated = x.hicp;
+      else x.hicpOfficial = x.hicp;
+      map.set(r.date,x);
+    });
     slicedAvg.forEach(r=>{
       const x = map.get(r.date) || { date: r.date };
       x.avgWage = Number.isFinite(r.value) ? r.value : undefined;
@@ -944,13 +1241,13 @@ export default function App(){
       real: row.wage!=null && row.hicp!=null ? row.wage / (row.hicp/100) : undefined,
       personal: personalMap.get(row.date)
     }));
-  }, [slicedW, slicedC, slicedAvg, slicedHousing, personalMap]);
+  }, [slicedW, slicedC, slicedAvg, slicedHousing, personalMap, estimatedHicpDates]);
 
 // Changes using nearest points (fix for sparse data)
 const wageChange = useMemo(()=> changePctNearest(wageSeries, start, end), [wageSeries,start,end]);
 const avgWageChange = useMemo(()=> changePctNearest(avgWageSeries, start, end), [avgWageSeries,start,end]); // ← add this
 const housingChange = useMemo(()=> changePctNearest(housingSeries, start, end), [housingSeries,start,end]);
-const hicpChange = useMemo(()=> changePctNearest(hicpSeries, start, end), [hicpSeries,start,end]);
+const hicpChange = useMemo(()=> changePctNearest(hicpSeriesForCalc, start, end), [hicpSeriesForCalc,start,end]);
 const realChange = wageChange!=null && hicpChange!=null ? wageChange - hicpChange : null;
 
 
@@ -1033,6 +1330,7 @@ const loadDefaults = async () => {
           <h2 className="section-title">1) Въведи/обнови заплати</h2>
           <SalaryTable key={resetCounter} onChange={setWages}/>
           <WagesUploader onRows={setWages}/>
+          <PrivateWagesLoader onRows={setWages}/>
       <div className="row mt-2">
           <button
             className="btn"
@@ -1117,6 +1415,25 @@ setHicpByCoicop(prev => ({ ...prev, ...byCode }));
 
       <section className="card mt-4">
         <h2 className="section-title">4) Период и резултати</h2>
+        <div className="row" style={{gap:8, marginBottom:10}}>
+          <button
+            type="button"
+            className={`btn ${inflationMode === 'official' ? 'btn-primary' : ''}`}
+            onClick={()=>setInflationMode('official')}
+          >
+            Официални данни
+          </button>
+          <button
+            type="button"
+            className={`btn ${inflationMode === 'estimate' ? 'btn-primary' : ''}`}
+            onClick={()=>setInflationMode('estimate')}
+          >
+            Оценка до текущ месец
+          </button>
+          {lastOfficialHicpMonth && (
+            <span className="help">Официални HICP данни до: {lastOfficialHicpMonth}</span>
+          )}
+        </div>
         <PeriodPickerMonth
           min={pickerDates[0]||'2000-01'}
           max={pickerDates[pickerDates.length-1]||'2000-01'}
@@ -1126,7 +1443,11 @@ setHicpByCoicop(prev => ({ ...prev, ...byCode }));
         />
 
         <div className="grid grid-2 mt-3" style={{gridTemplateColumns:'repeat(4,1fr)'}}>
-          <Card title="Официална инфлация" value={hicpChange!=null? (hicpChange*100).toFixed(1)+'%':'—'} note="HICP за избрания период"/>
+          <Card
+            title={inflationMode === 'estimate' ? 'Инфлация (оценка)' : 'Официална инфлация'}
+            value={hicpChange!=null? (hicpChange*100).toFixed(1)+'%':'—'}
+            note={inflationMode === 'estimate' ? 'HICP + nowcast след последния официален месец' : 'HICP за избрания период'}
+          />
           <Card title="Промяна на заплатата" value={wageChange!=null? (wageChange*100).toFixed(1)+'%':'—'} note="Най-близки налични месеци"/>
           <Card title="Реална промяна" value={realChange!=null? (realChange*100).toFixed(1)+'%':'—'} note="Покупателна способност"/>
           <Card title="Реално увеличение (официално)" value={realChangeOfficial!=null ? realChangeOfficial.toFixed(1)+'%' : '—'} />
@@ -1163,7 +1484,8 @@ setHicpByCoicop(prev => ({ ...prev, ...byCode }));
               <Legend />
               <ReferenceLine y={100} stroke="#e5e7eb" strokeDasharray="4 4" />
               <Line type="monotone" dataKey="wage" name="Индекс заплата (=100)" stroke="#2563eb" dot={false} connectNulls isAnimationActive={false} />
-              <Line type="monotone" dataKey="hicp" name="Индекс цени (HICP, =100)" stroke="#16a34a" dot={false} connectNulls isAnimationActive={false} />
+              <Line type="monotone" dataKey="hicpOfficial" name="Индекс цени (HICP, =100)" stroke="#16a34a" dot={false} connectNulls isAnimationActive={false} />
+              <Line type="monotone" dataKey="hicpEstimated" name="Индекс цени (оценка)" stroke="#16a34a" strokeDasharray="6 4" dot={false} connectNulls isAnimationActive={false} />
               <Line type="monotone" dataKey="real" name="Реален индекс (заплата/цени)" stroke="#dc2626" dot={false} connectNulls isAnimationActive={false} />
               <Line type="monotone" dataKey="personal" name="Личен индекс (=100)" stroke="#7c3aed" dot={false} connectNulls isAnimationActive={false} />
               {hasHousing && (
