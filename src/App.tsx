@@ -15,7 +15,7 @@ export type Row = { date: string; value: number };
 export type Expense = { date: string; category: string; amount: number };
 
 // IDB store names
-export type RowStore = "wages" | "hicp";
+export type RowStore = "wages" | "hicp" | "personalInflation";
 export type MetaStore = "meta";
 export type ExpenseStore = "expenses";
 export type StoreName = RowStore | MetaStore | ExpenseStore;
@@ -66,11 +66,12 @@ function displayCategory(key: keyof typeof COICOP_MAP){ return CATEGORY_BG[key] 
 interface MyDB extends DBSchema {
   wages: { key: string; value: Row[] };
   hicp: { key: string; value: Row[] };
+  personalInflation: { key: string; value: Row[] };
   expenses: { key: string; value: Expense[] };
   meta: { key: string; value: unknown };
 }
 const DB_NAME = "personal-inflation";
-const DB_VERSION = 6;
+const DB_VERSION = 7;
 let _dbPromise: Promise<IDBPDatabase<MyDB>> | null = null;
 async function getDB(){
   if(!_dbPromise){
@@ -78,6 +79,7 @@ async function getDB(){
       upgrade(db){
         if(!db.objectStoreNames.contains('wages')) db.createObjectStore('wages');
         if(!db.objectStoreNames.contains('hicp')) db.createObjectStore('hicp');
+        if(!db.objectStoreNames.contains('personalInflation')) db.createObjectStore('personalInflation');
         if(!db.objectStoreNames.contains('expenses')) db.createObjectStore('expenses');
         if(!db.objectStoreNames.contains('meta')) db.createObjectStore('meta');
       }
@@ -102,6 +104,7 @@ async function clearAllData(){
   const db = await getDB();
   await db.clear('wages');
   await db.clear('hicp');
+  await db.clear('personalInflation');
   await db.clear('expenses');
   await db.clear('meta');
 }
@@ -692,7 +695,8 @@ function InfoTooltip({ active, payload, label }: any){
     hicpOfficial: "Официален индекс на потребителските цени (HICP).",
     hicpEstimated: "Оценка след последния публикуван месец.",
     real: "Покупателна способност = заплата/цени.",
-    personal: "Личен индекс според твоите разходи и HICP по категории.",
+    personal: "Лична инфлация според твоите разходи и HICP по категории.",
+    realPersonal: "Лична покупателна способност = заплата/лични цени.",
     housingPrice: "Средна цена на жилище (индекс, 2015=100) от Eurostat."
   };
   return (
@@ -882,8 +886,7 @@ function WagesUploader({ onRows }:{onRows:(rows:Row[])=>void}){
   );
 }
 
-function PrivateWagesLoader({ onRows }:{onRows:(rows:Row[])=>void}){
-  const [password, setPassword] = useState('');
+function PrivateWagesLoader({ onRows, password }:{onRows:(rows:Row[])=>void; password:string}){
   const [status, setStatus] = useState('');
   const [loading, setLoading] = useState(false);
   const [failedAttempts, setFailedAttempts] = useState(0);
@@ -896,10 +899,6 @@ function PrivateWagesLoader({ onRows }:{onRows:(rows:Row[])=>void}){
 
   const loadPrivateWages = async ()=>{
     if (isLocked || loading) return;
-    if (!password.trim()) {
-      setStatus('Въведи парола.');
-      return;
-    }
     setLoading(true);
     setStatus('Зареждане на лични заплати...');
     try {
@@ -939,7 +938,6 @@ function PrivateWagesLoader({ onRows }:{onRows:(rows:Row[])=>void}){
       onRows(rows);
       setFailedAttempts(0);
       setLockedUntil(null);
-      setPassword('');
       setStatus(`Лични заплати: ${rows.length} реда (заменени).`);
     } catch (e:any) {
       setStatus('Грешка: ' + (e?.message || e));
@@ -964,20 +962,65 @@ function PrivateWagesLoader({ onRows }:{onRows:(rows:Row[])=>void}){
     <div className="mt-3">
       <div className="text-muted-2" style={{fontSize:14,fontWeight:600}}>Защитено зареждане на лични заплати</div>
       <div className="row row-lg mt-2">
-        <input
-          type="password"
-          className="w-100 minw-240"
-          placeholder="Парола"
-          value={password}
-          onChange={e=>setPassword(e.target.value)}
-          onKeyDown={e=>{ if (e.key === 'Enter') loadPrivateWages(); }}
-          disabled={loading || isLocked}
-        />
         <button className="btn btn-primary" onClick={loadPrivateWages} disabled={loading || isLocked}>
           {loading ? 'Зареждане...' : 'Зареди моята заплата'}
         </button>
       </div>
       {isLocked && <div className="help">Заключено за {remainingSec} сек.</div>}
+      {status && <div className="help">{status}</div>}
+    </div>
+  );
+}
+
+function PrivatePersonalInflationLoader({ onRows, password }:{onRows:(rows:Row[])=>void; password:string}){
+  const [status, setStatus] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const loadPrivatePersonalInflation = async ()=>{
+    if (loading) return;
+    setLoading(true);
+    setStatus('Зареждане на лична инфлация...');
+    try {
+      const res = await fetch('/.netlify/functions/private-personal-inflation', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password })
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setStatus(`Грешка: ${payload?.error || `HTTP ${res.status}`}`);
+        return;
+      }
+
+      const rawRows = Array.isArray(payload?.rows) ? payload.rows : [];
+      const rows: Row[] = rawRows
+        .map((r:any)=>({ date: String(r?.date || ''), value: Number(r?.value) }))
+        .filter((r:Row)=> /^\d{4}-\d{2}$/.test(r.date) && Number.isFinite(r.value))
+        .sort((a:Row,b:Row)=>a.date.localeCompare(b.date));
+
+      if (!rows.length) {
+        setStatus('Няма валидни редове в защитения файл.');
+        return;
+      }
+
+      await saveRows('personalInflation', rows);
+      onRows(rows);
+      setStatus(`Лична инфлация: ${rows.length} реда (заменени).`);
+    } catch (e:any) {
+      setStatus('Грешка: ' + (e?.message || e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="mt-3">
+      <div className="text-muted-2" style={{fontSize:14,fontWeight:600}}>Защитено зареждане на лична инфлация</div>
+      <div className="row row-lg mt-2">
+        <button className="btn btn-primary" onClick={loadPrivatePersonalInflation} disabled={loading}>
+          {loading ? 'Зареждане...' : 'Зареди лична инфлация'}
+        </button>
+      </div>
       {status && <div className="help">{status}</div>}
     </div>
   );
@@ -1124,6 +1167,7 @@ function ExpensesTable({ onChange }:{onChange:(rows:Expense[])=>void}){
 export default function App(){
   const [wages,setWages]=useState<Row[]>([]);
   const [hicp,setHicp]=useState<Row[]>([]);
+  const [personalInflationRows,setPersonalInflationRows]=useState<Row[]>([]);
   const [expenses,setExpenses]=useState<Expense[]>([]);
   const [hicpByCoicop,setHicpByCoicop]=useState<Record<string,Row[]>>({});
   const [catStatus,setCatStatus]=useState('');
@@ -1133,8 +1177,23 @@ export default function App(){
   const [housingPrices, setHousingPrices] = useState<Row[]>([]);
   const [resetCounter, setResetCounter] = useState(0);
   const [inflationMode, setInflationMode] = useState<'official' | 'estimate'>('official');
+  const [hiddenSeries, setHiddenSeries] = useState<Record<string, boolean>>({});
+  const [isChartFullscreen, setIsChartFullscreen] = useState(false);
+  const [adminPassword, setAdminPassword] = useState('');
+  const [adminUnlocked, setAdminUnlocked] = useState(false);
 
-  useEffect(()=>{ loadRows('wages').then(setWages); loadRows('hicp').then(setHicp); loadExpenses().then(setExpenses); },[]);
+  useEffect(() => {
+    if (!isChartFullscreen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setIsChartFullscreen(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isChartFullscreen]);
+
+  useEffect(()=>{ loadRows('wages').then(setWages); loadRows('hicp').then(setHicp); loadRows('personalInflation').then(setPersonalInflationRows); loadExpenses().then(setExpenses); },[]);
 // On first run with empty stores, autoload defaults once
 // useEffect(()=>{
 //   (async ()=>{
@@ -1210,9 +1269,12 @@ export default function App(){
   const { baseUsed, weights } = useMemo(()=> pickBaseMonthForWeights(expenses, start), [expenses, start]);
   useEffect(()=>{ setWeightsBaseUsed(baseUsed); }, [baseUsed]);
   const personalSeries = useMemo(()=>{
+    if(personalInflationRows.length){
+      return rangeSlice(rebaseTo100(toMonthlySeries(personalInflationRows), start), start, end);
+    }
     if(!Object.keys(weights).length || !datesSorted.length) return [];
     return computePersonalIndex(weights, hicpByCoicop, datesSorted, start, COICOP_MAP);
-  }, [weights, hicpByCoicop, datesSorted, start]);
+  }, [personalInflationRows, weights, hicpByCoicop, datesSorted, start, end]);
   const rebasedPersonal = useMemo(()=> rebaseTo100(personalSeries, start), [personalSeries, start]);
   const personalMap = useMemo(()=> new Map(rebasedPersonal.map(p=>[p.date,p.value])), [rebasedPersonal]);
 
@@ -1236,11 +1298,17 @@ export default function App(){
       x.housingPrice = Number.isFinite(r.value) ? r.value : undefined;
       map.set(r.date, x);
     });
-    return [...map.values()].sort((a,b)=>a.date.localeCompare(b.date)).map(row=>({
-      ...row,
-      real: row.wage!=null && row.hicp!=null ? row.wage / (row.hicp/100) : undefined,
-      personal: personalMap.get(row.date)
-    }));
+    return [...map.values()].sort((a,b)=>a.date.localeCompare(b.date)).map(row=>{
+      const realOfficial = row.wage!=null && row.hicp!=null ? row.wage / (row.hicp/100) : undefined;
+      const personalInflation = personalMap.get(row.date);
+      const realPersonal = row.wage!=null && personalInflation!=null ? row.wage / (personalInflation/100) : undefined;
+      return {
+        ...row,
+        real: realOfficial,
+        personal: personalInflation,
+        realPersonal,
+      };
+    });
   }, [slicedW, slicedC, slicedAvg, slicedHousing, personalMap, estimatedHicpDates]);
 
 // Changes using nearest points (fix for sparse data)
@@ -1268,6 +1336,25 @@ const chartKey = useMemo(()=>
 );
 const hasAvg = avgWages.length > 0;
 const hasHousing = housingPrices.length > 0;
+const isSeriesHidden = (key: string) => !!hiddenSeries[key];
+const toggleSeries = (rawKey: string) => {
+  const key = String(rawKey || '');
+  if (!key) return;
+  const linked = key === 'hicpOfficial' || key === 'hicpEstimated'
+    ? ['hicpOfficial', 'hicpEstimated']
+    : [key];
+  setHiddenSeries(prev => {
+    const next = { ...prev };
+    const shouldHide = !linked.every(k => prev[k]);
+    linked.forEach(k => { next[k] = shouldHide; });
+    return next;
+  });
+};
+const formatLegendLabel = (value: string, entry: any) => {
+  const key = String(entry?.dataKey || '');
+  const hidden = isSeriesHidden(key);
+  return <span style={{ opacity: hidden ? 0.45 : 1 }}>{value}</span>;
+};
 
 // Default CSV asset URLs (served by Vite)
 const DEFAULT_WAGES_CSV = new URL('../data/avg_wage_bg_2015_2025.csv', import.meta.url);
@@ -1307,6 +1394,21 @@ const loadDefaults = async () => {
       <header className="row" style={{justifyContent:'space-between',alignItems:'center'}}>
       <h1 className="page-title">Лична инфлация — Enhanced</h1>
 <div className="row" style={{gap:8}}>
+  {!adminUnlocked ? (
+    <button className="btn" onClick={()=>{
+      const pwd = window.prompt('Админ парола');
+      if (pwd && pwd.trim()) {
+        setAdminPassword(pwd.trim());
+        setAdminUnlocked(true);
+      }
+    }}>
+      Админ
+    </button>
+  ) : (
+    <button className="btn" onClick={()=>{ setAdminUnlocked(false); setAdminPassword(''); }}>
+      Скрий админ
+    </button>
+  )}
   <button className="btn" onClick={async()=>{ await loadDefaults(); }}>
     Зареди дефолтни данни
   </button>
@@ -1330,7 +1432,7 @@ const loadDefaults = async () => {
           <h2 className="section-title">1) Въведи/обнови заплати</h2>
           <SalaryTable key={resetCounter} onChange={setWages}/>
           <WagesUploader onRows={setWages}/>
-          <PrivateWagesLoader onRows={setWages}/>
+          {adminUnlocked && <PrivateWagesLoader onRows={setWages} password={adminPassword}/>} 
       <div className="row mt-2">
           <button
             className="btn"
@@ -1384,6 +1486,7 @@ const loadDefaults = async () => {
 
       <section className="card mt-4">
         <h2 className="section-title">3) Лични разходи (CP01–CP12)</h2>
+        {adminUnlocked && <PrivatePersonalInflationLoader onRows={setPersonalInflationRows} password={adminPassword}/>} 
         <ExpensesTable key={resetCounter} onChange={setExpenses}/>
         <ExpensesUploader onRows={setExpenses}/>
         <div className="row mt-2">
@@ -1391,7 +1494,11 @@ const loadDefaults = async () => {
           data-testid="fetch-coicop-btn"
           onClick={async()=>{
             const needed=[...new Set(Object.keys(weights).map(c=>COICOP_MAP[c]).filter(Boolean))];
-            if(!needed.length){ setCatStatus('Няма тегла за базовия месец. Добави разходи.'); return; }
+            if (personalInflationRows.length) {
+              setCatStatus('Ползва се заредена лична инфлация. Тегла и категории не са нужни.');
+              return;
+            }
+            if(!needed.length){ setCatStatus('Няма тегла за базовия месец. Добави разходи или зареди лична инфлация.'); return; }
               setCatStatus('Изтегляне на HICP по категории...');
               try{
                 const byCode = await fetchEurostatHICPForSDMX(needed, {
@@ -1442,7 +1549,7 @@ setHicpByCoicop(prev => ({ ...prev, ...byCode }));
           onChange={(s,e)=>{ touched.current=true; setStart(s); setEnd(e); }}
         />
 
-        <div className="grid grid-2 mt-3" style={{gridTemplateColumns:'repeat(4,1fr)'}}>
+        <div className="metric-grid mt-3">
           <Card
             title={inflationMode === 'estimate' ? 'Инфлация (оценка)' : 'Официална инфлация'}
             value={hicpChange!=null? (hicpChange*100).toFixed(1)+'%':'—'}
@@ -1471,8 +1578,18 @@ setHicpByCoicop(prev => ({ ...prev, ...byCode }));
 
       <section className="card mt-4">
         <h2 className="section-title">5) Визуализация</h2>
+        <div className="row mt-2">
+          <button className="btn" onClick={()=>setIsChartFullscreen(v=>!v)}>
+            {isChartFullscreen ? 'Изход от цял екран' : 'Цял екран'}
+          </button>
+        </div>
         <div className="help">Всички линии са ребазирани = 100 в началния месец. Tooltip дава описание.</div>
-        <div className="chart-wrap" data-testid="result-chart">
+        <div className={`chart-wrap ${isChartFullscreen ? 'chart-wrap-fullscreen' : ''}`} data-testid="result-chart">
+          {isChartFullscreen && (
+            <button className="chart-exit-btn" aria-label="Затвори цял екран" onClick={()=>setIsChartFullscreen(false)}>
+              ×
+            </button>
+          )}
           <ResponsiveContainer width="100%" height="100%">
             <LineChart key={chartKey} data={merged} margin={{ top: 8, right: 16, bottom: 8, left: 8 }}>
               <XAxis dataKey="date" minTickGap={24} allowDuplicatedCategory={false} />
@@ -1481,18 +1598,19 @@ setHicpByCoicop(prev => ({ ...prev, ...byCode }));
   domain={['dataMin','dataMax']}
 />
               <Tooltip content={<InfoTooltip />} />
-              <Legend />
+              <Legend onClick={(e:any)=>toggleSeries(e?.dataKey)} formatter={formatLegendLabel} />
               <ReferenceLine y={100} stroke="#e5e7eb" strokeDasharray="4 4" />
-              <Line type="monotone" dataKey="wage" name="Индекс заплата (=100)" stroke="#2563eb" dot={false} connectNulls isAnimationActive={false} />
-              <Line type="monotone" dataKey="hicpOfficial" name="Индекс цени (HICP, =100)" stroke="#16a34a" dot={false} connectNulls isAnimationActive={false} />
-              <Line type="monotone" dataKey="hicpEstimated" name="Индекс цени (оценка)" stroke="#16a34a" strokeDasharray="6 4" dot={false} connectNulls isAnimationActive={false} />
-              <Line type="monotone" dataKey="real" name="Реален индекс (заплата/цени)" stroke="#dc2626" dot={false} connectNulls isAnimationActive={false} />
-              <Line type="monotone" dataKey="personal" name="Личен индекс (=100)" stroke="#7c3aed" dot={false} connectNulls isAnimationActive={false} />
+              <Line type="monotone" dataKey="wage" name="Индекс заплата (=100)" stroke="#2563eb" dot={false} connectNulls isAnimationActive={false} hide={isSeriesHidden('wage')} />
+              <Line type="monotone" dataKey="hicpOfficial" name="Индекс цени (HICP, =100)" stroke="#16a34a" dot={false} connectNulls isAnimationActive={false} hide={isSeriesHidden('hicpOfficial')} />
+              <Line type="monotone" dataKey="hicpEstimated" name="Индекс цени (оценка)" stroke="#16a34a" strokeDasharray="6 4" dot={false} connectNulls isAnimationActive={false} hide={isSeriesHidden('hicpEstimated')} />
+              <Line type="monotone" dataKey="real" name="Реален индекс (официален, заплата/цени)" stroke="#dc2626" dot={false} connectNulls isAnimationActive={false} hide={isSeriesHidden('real')} />
+              <Line type="monotone" dataKey="personal" name="Личен ценови индекс (=100)" stroke="#7c3aed" dot={false} connectNulls isAnimationActive={false} hide={isSeriesHidden('personal')} />
+              <Line type="monotone" dataKey="realPersonal" name="Лична покупателна способност (заплата/лични цени)" stroke="#a16207" dot={false} connectNulls isAnimationActive={false} hide={isSeriesHidden('realPersonal')} />
               {hasHousing && (
-                <Line type="monotone" dataKey="housingPrice" name="Средна цена на жилище (БГ, =100)" stroke="#0ea5e9" dot={false} connectNulls isAnimationActive={false} />
+                <Line type="monotone" dataKey="housingPrice" name="Средна цена на жилище (БГ, =100)" stroke="#0ea5e9" dot={false} connectNulls isAnimationActive={false} hide={isSeriesHidden('housingPrice')} />
               )}
               {hasAvg && (
-                <Line type="monotone" dataKey="avgWage" name="Индекс средна заплата (БГ, =100)" stroke="#f59e0b" dot={false} connectNulls isAnimationActive={false} />
+                <Line type="monotone" dataKey="avgWage" name="Индекс средна заплата (БГ, =100)" stroke="#f59e0b" dot={false} connectNulls isAnimationActive={false} hide={isSeriesHidden('avgWage')} />
               )} 
               </LineChart>
           </ResponsiveContainer>

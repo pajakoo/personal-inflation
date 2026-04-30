@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "node scripts/vite-runner.js dev",
+    "dev:netlify": "netlify dev",
     "build": "node scripts/vite-runner.js build",
     "preview": "node scripts/vite-runner.js preview",
     "test": "vitest run --reporter=basic",

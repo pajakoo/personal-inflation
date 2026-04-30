@@ -23,8 +23,8 @@ exports.handler = async (event) => {
 
   const password = String(payload.password || '');
   const expectedPassword = process.env.WAGES_PASSWORD || '';
-  const rowsJson = process.env.WAGES_ROWS_JSON || '';
-  const rowsFile = process.env.WAGES_ROWS_FILE || 'data/wages.rows.json';
+  const rowsJson = process.env.PERSONAL_INFLATION_ROWS_JSON || '';
+  const rowsFile = process.env.PERSONAL_INFLATION_ROWS_FILE || 'data/personal_inflation.rows.json';
 
   if (!expectedPassword) {
     return {
@@ -50,7 +50,7 @@ exports.handler = async (event) => {
       return {
         statusCode: 500,
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ error: 'Invalid WAGES_ROWS_JSON format' })
+        body: JSON.stringify({ error: 'Invalid PERSONAL_INFLATION_ROWS_JSON format' })
       };
     }
   } else {
@@ -62,7 +62,7 @@ exports.handler = async (event) => {
       return {
         statusCode: 500,
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ error: `Missing/invalid wages file: ${rowsFile}` })
+        body: JSON.stringify({ error: `Missing/invalid personal inflation file: ${rowsFile}` })
       };
     }
   }
@@ -71,7 +71,7 @@ exports.handler = async (event) => {
     return {
       statusCode: 500,
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ error: 'WAGES_ROWS_JSON must be an array' })
+      body: JSON.stringify({ error: 'PERSONAL_INFLATION_ROWS_JSON must be an array' })
     };
   }
 
